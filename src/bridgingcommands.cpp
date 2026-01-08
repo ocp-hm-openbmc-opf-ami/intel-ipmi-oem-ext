@@ -167,15 +167,14 @@ IpmbRequest::IpmbRequest(const ipmbHeader* ipmbBuffer, size_t bufferLength)
 IpmbResponse::IpmbResponse(uint8_t address, uint8_t netFn, uint8_t rqLun,
                            uint8_t rsSA, uint8_t seq, uint8_t rsLun,
                            uint8_t cmd, uint8_t completionCode,
-                           std::vector<uint8_t>& inputData) :
+                           std::vector<uint8_t> inputData) :
     address(address), netFn(netFn), rqLun(rqLun), rsSA(rsSA), seq(seq),
-    rsLun(rsLun), cmd(cmd), completionCode(completionCode)
+    rsLun(rsLun), cmd(cmd), completionCode(completionCode),
+    data(std::move(inputData))
 {
-    data.reserve(ipmbMaxDataSize);
-
-    if (inputData.size() > 0)
+    if (data.empty())
     {
-        data = std::move(inputData);
+        data.reserve(ipmbMaxDataSize);
     }
 }
 
@@ -435,6 +434,8 @@ ipmi::RspType<std::vector<uint8_t> // responseData
     std::vector<uint8_t> unpackMsg;
 
     auto channelNo = static_cast<uint8_t>(channelNumber);
+    uint8_t devIndex = 0xFF;
+    uint8_t channelTypeME = 1;
     // Get the channel number
     switch (channelNo)
     {
@@ -442,6 +443,21 @@ ipmi::RspType<std::vector<uint8_t> // responseData
         case targetChannelIpmb1:
         case targetChannelIpmb2:
         case targetChannelIpmb3:
+            devIndex = getDevIndexForChannel(channelNo);
+            if (devIndex == invalidChannel)
+            {
+                phosphor::logging::log<phosphor::logging::level::ERR>(
+                    "ipmiAppSendMessage: Invalid IPMI channel number");
+                return ipmi::responseParmOutOfRange();
+            }
+            ipmbMeChannelNum = calculateChannelIdxNum(devIndex, channelTypeME);
+            if (ipmbMeChannelNum == invalidChannel)
+            {
+                phosphor::logging::log<phosphor::logging::level::ERR>(
+                    "ipmiAppSendMessage: Invalid IPMB ME Channel Index");
+                return ipmi::responseParmOutOfRange();
+            }
+
             if (msg.unpack(unpackMsg) || !msg.fullyUnpacked())
             {
                 return ipmi::responseReqDataLenInvalid();

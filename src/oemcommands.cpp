@@ -45,6 +45,7 @@
 #include <ipmid/utils.hpp>
 #include <nlohmann/json.hpp>
 #include <oemcommands.hpp>
+#include <phosphor-logging/lg2.hpp>
 #include <phosphor-logging/log.hpp>
 #include <sdbusplus/bus.hpp>
 #include <sdbusplus/message/types.hpp>
@@ -62,6 +63,11 @@
 /*TODO: enable once phosphor-dbus-interface patch updated
 #include <xyz/openbmc_project/USB/status/server.hpp>
 */
+
+#include "storagecommands.hpp"
+
+#include <phosphor-ipmi-host/selutility.hpp>
+#include <sdrutils.hpp>
 
 #include <algorithm>
 #include <array>
@@ -106,6 +112,8 @@ static constexpr const char* redfishHostInterfaceChannel = "usb0";
 
 // User Manager object in dbus
 static constexpr const char* userMgrObjBasePath = "/xyz/openbmc_project/user";
+static constexpr const char* AccountPolicyInterface =
+    "xyz.openbmc_project.User.AccountPolicy";
 static constexpr const char* userMgrInterface =
     "xyz.openbmc_project.User.Manager";
 static constexpr const char* usersInterface =
@@ -114,6 +122,8 @@ static constexpr const char* usersDeleteIface =
     "xyz.openbmc_project.Object.Delete";
 static constexpr const char* createUserMethod = "CreateUser";
 static constexpr const char* deleteUserMethod = "Delete";
+static constexpr const char* ChannelInterfaceMapMethod =
+    "GetChannelInterfaceMap";
 
 // BIOSConfig Manager object in dbus
 static constexpr const char* biosConfigMgrPath =
@@ -168,7 +178,6 @@ const static constexpr char* systemDService = "org.freedesktop.systemd1";
 const static constexpr char* systemDObjPath = "/org/freedesktop/systemd1";
 const static constexpr char* systemDMgrIntf =
     "org.freedesktop.systemd1.Manager";
-const std::string ipmiKcsService = "phosphor-ipmi-kcs@ipmi_kcs3.service";
 constexpr auto systemDInterfaceUnit = "org.freedesktop.DBus.Properties";
 constexpr auto activeState = "active";
 constexpr auto activatingState = "activating";
@@ -178,8 +187,9 @@ const static constexpr char* settingsObjPath =
     "/xyz/openbmc_project/logging/settings";
 const static constexpr char* settingsUSBIntf = "xyz.openbmc_project.USB";
 
-const static constexpr char* snmpService = "xyz.openbmc_project.Snmp";
-const static constexpr char* snmpObjPath = "/xyz/openbmc_project/Snmp";
+const static constexpr char* snmpService = "xyz.openbmc_project.Snmp.Conf";
+const static constexpr char* snmpObjPath =
+    "/xyz/openbmc_project/snmp/SnmpUtils";
 const static constexpr char* snmpUtilsIntf =
     "xyz.openbmc_project.Snmp.SnmpUtils";
 // Task
@@ -207,9 +217,24 @@ static constexpr const char* chassisStatePath =
 static constexpr const char* chassisStateIntf =
     "xyz.openbmc_project.State.Chassis";
 
+static constexpr const char* serviceMgr =
+    "xyz.openbmc_project.Control.Service.Manager";
+static constexpr const char* basePath = "/xyz/openbmc_project/control/service";
+static constexpr const char* attrIntf =
+    "xyz.openbmc_project.Control.Service.Attributes";
+static constexpr const char* objectManagerIntf =
+    "org.freedesktop.DBus.ObjectManager";
+static constexpr const char* getMgdObjMethod = "GetManagedObjects";
+
 static constexpr uint8_t maxlentimezone = 64;
 
 constexpr bool debug = false;
+
+enum class KCSStatus : uint8_t
+{
+    Disable = 0,
+    Enable = 1
+};
 
 enum class NmiSource : uint8_t
 {
@@ -249,6 +274,59 @@ static constexpr const char* dBusPropertyIntf =
     "org.freedesktop.DBus.Properties";
 static constexpr const char* dBusPropertyGetMethod = "Get";
 static constexpr const char* dBusPropertySetMethod = "Set";
+
+constexpr const char* MAPPER_PATH = "/xyz/openbmc_project/object_mapper";
+constexpr const char* MAPPER_INTERFACE = "xyz.openbmc_project.ObjectMapper";
+
+constexpr const char* PRESERVE_ROOT =
+    "/xyz/openbmc_project/inventory/system/configuration";
+constexpr const char* PRESERVE_INTERFACE =
+    "xyz.openbmc_project.Configuration.Preserve";
+
+#define MAX_PRESERVE_CONFIGS 18
+
+enum class ConfigName
+{
+    Boot_Override,
+    EXTLOG,
+    IPMI,
+    NETWORK,
+    NTP,
+    SOL,
+    SYSLOG,
+    U_BOOT_ENV,
+    AUTHENTICATION,
+    FRU,
+    KVM,
+    LicenseControl,
+    REDFISH,
+    SDR,
+    SEL,
+    SMTP,
+    SNMP,
+    ServiceManager,
+    Invalid
+};
+
+const std::unordered_map<std::string, ConfigName> configNameMap = {
+    {"Boot_Override", ConfigName::Boot_Override},
+    {"EXTLOG", ConfigName::EXTLOG},
+    {"IPMI", ConfigName::IPMI},
+    {"NETWORK", ConfigName::NETWORK},
+    {"NTP", ConfigName::NTP},
+    {"SOL", ConfigName::SOL},
+    {"SYSLOG", ConfigName::SYSLOG},
+    {"U_BOOT_ENV", ConfigName::U_BOOT_ENV},
+    {"AUTHENTICATION", ConfigName::AUTHENTICATION},
+    {"FRU", ConfigName::FRU},
+    {"KVM", ConfigName::KVM},
+    {"LicenseControl", ConfigName::LicenseControl},
+    {"REDFISH", ConfigName::REDFISH},
+    {"SDR", ConfigName::SDR},
+    {"SEL", ConfigName::SEL},
+    {"SMTP", ConfigName::SMTP},
+    {"SNMP", ConfigName::SNMP},
+    {"ServiceManager", ConfigName::ServiceManager}};
 
 // return code: 0 successful
 int8_t getChassisSerialNumber(sdbusplus::bus_t& bus, std::string& serial)
@@ -5759,61 +5837,73 @@ ipmi::RspType<std::vector<uint8_t>> ipmiOEMReadCertficate(
     return ipmi::responseSuccess(caSubVec);
 }
 
-ipmi::RspType<uint8_t> ipmiOEMGetKCSStatus(
-    [[maybe_unused]] ipmi::Context::ptr ctx)
+inline bool isKcsObjectPath(const std::string& path)
+{
+    return (path.find("phosphor_2dipmi_2dkcs") != std::string::npos);
+}
+
+static std::vector<std::string> getAllKcsPaths(ipmi::Context::ptr& ctx)
+{
+    std::vector<std::string> paths;
+
+    boost::system::error_code ec;
+
+    auto managedObjs = ctx->bus->yield_method_call<ipmi::ObjectValueTree>(
+        ctx->yield, ec, serviceMgr, basePath, objectManagerIntf,
+        getMgdObjMethod);
+
+    if (ec)
+    {
+        lg2::error("Failed to get managed objects for KCS status: {EC}", "EC",
+                   ec.message());
+        return paths;
+    }
+
+    for (const auto& [path, _] : managedObjs)
+    {
+        if (isKcsObjectPath(path))
+        {
+            paths.push_back(path);
+        }
+    }
+    return paths;
+}
+
+ipmi::RspType<uint8_t> ipmiOEMGetKCSStatus(ipmi::Context::ptr ctx)
 {
     try
     {
-        // Establish a D-Bus connection
-        auto dbus = getSdBus();
+        auto& bus = ctx->bus;
+        auto kcsPaths = getAllKcsPaths(ctx);
 
-        // Create method call message to get the service unit properties
-        auto method = dbus->new_method_call(systemDService, systemDObjPath,
-                                            systemDMgrIntf, "GetUnit");
-        method.append(ipmiKcsService);
-
-        auto reply = dbus->call(method);
-
-        // Process the reply to extract the service status
-        std::variant<std::string> currentState;
-        sdbusplus::message::object_path unitTargetPath;
-
-        reply.read(unitTargetPath);
-
-        method = dbus->new_method_call(
-            systemDService,
-            static_cast<const std::string&>(unitTargetPath).c_str(),
-            systemDInterfaceUnit, "Get");
-
-        method.append("org.freedesktop.systemd1.Unit", "ActiveState");
-        try
+        if (kcsPaths.empty())
         {
-            auto result = dbus->call(method);
-            result.read(currentState);
-        }
-        catch (const sdbusplus::exception_t& e)
-        {
-            syslog(LOG_WARNING, "Error in ActiveState Get:%s\n", e.what());
-            return ipmi::responseResponseError();
-        }
-        // Check the service state
-        const auto& currentStateStr = std::get<std::string>(currentState);
-
-        uint8_t kcsstate = 0;
-
-        if (currentStateStr == activeState ||
-            currentStateStr == activatingState)
-        {
-            kcsstate = 1;
-        }
-        else
-        {
-            kcsstate = 0;
+            return ipmi::response(ccParameterNotSupported);
         }
 
-        return ipmi::responseSuccess(kcsstate);
+        for (const auto& path : kcsPaths)
+        {
+            try
+            {
+                auto service = ipmi::getService(*bus, attrIntf, path);
+
+                // Get the Running property for this KCS device
+                auto value = ipmi::getDbusProperty(*bus, service, path,
+                                                   attrIntf, "Running");
+                if (std::get<bool>(value))
+                {
+                    return ipmi::responseSuccess(
+                        static_cast<uint8_t>(KCSStatus::Enable));
+                }
+            }
+            catch (const sdbusplus::exception_t&)
+            {
+                ipmi::responseUnspecifiedError();
+            }
+        }
+        return ipmi::responseSuccess(static_cast<uint8_t>(KCSStatus::Disable));
     }
-    catch (const sdbusplus::exception_t& e)
+    catch (const sdbusplus::exception_t&)
     {
         return ipmi::responseSuccess(static_cast<uint8_t>(KCSStatus::Disable));
     }
@@ -5821,45 +5911,43 @@ ipmi::RspType<uint8_t> ipmiOEMGetKCSStatus(
 
 ipmi::RspType<> ipmiOEMSetKCSStatus(ipmi::Context::ptr ctx, uint8_t reqData)
 {
-    constexpr bool runtimeOnly = false;
-    constexpr bool force = false;
-
-    if (reqData == static_cast<uint8_t>(KCSStatus::Disable))
+    if (reqData != static_cast<uint8_t>(KCSStatus::Disable) &&
+        reqData != static_cast<uint8_t>(KCSStatus::Enable))
     {
-        auto dbus = getSdBus();
-        auto method = dbus->new_method_call(systemDService, systemDObjPath,
-                                            systemDMgrIntf, "StopUnit");
-        method.append(ipmiKcsService, "replace");
-        auto reply = dbus->call(method);
-
-        // Append additional method call for disabling the unit
-        boost::system::error_code ec;
-        ctx->bus->yield_method_call(
-            ctx->yield, ec, systemDService, systemDObjPath, systemDMgrIntf,
-            "DisableUnitFiles",
-            std::array<const char*, 1>{ipmiKcsService.c_str()}, runtimeOnly);
-        return ipmi::responseSuccess();
-    }
-    else if (reqData == static_cast<uint8_t>(KCSStatus::Enable))
-    {
-        boost::system::error_code ec;
-        ctx->bus->yield_method_call(
-            ctx->yield, ec, systemDService, systemDObjPath, systemDMgrIntf,
-            "EnableUnitFiles",
-            std::array<const char*, 1>{ipmiKcsService.c_str()}, runtimeOnly,
-            force);
-
-        auto dbus = getSdBus();
-        auto method = dbus->new_method_call(systemDService, systemDObjPath,
-                                            systemDMgrIntf, "StartUnit");
-        method.append(ipmiKcsService, "replace");
-        auto reply = dbus->call(method);
-        return ipmi::responseSuccess();
+        return ipmi::responseInvalidFieldRequest();
     }
 
-    else
+    try
     {
-        return ipmi::responseResponseError();
+        auto bus = ctx->bus;
+        auto kcsPaths = getAllKcsPaths(ctx);
+
+        if (kcsPaths.empty())
+        {
+            return ipmi::response(ccParameterNotSupported);
+        }
+
+        bool masked = (reqData == static_cast<uint8_t>(KCSStatus::Disable));
+
+        for (const auto& path : kcsPaths)
+        {
+            try
+            {
+                auto service = ipmi::getService(*bus, attrIntf, path);
+                ipmi::setDbusProperty(*bus, service, path, attrIntf, "Masked",
+                                      masked);
+            }
+            catch (const sdbusplus::exception_t&)
+            {
+                ipmi::responseUnspecifiedError();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        return ipmi::responseSuccess();
+    }
+    catch (const sdbusplus::exception_t&)
+    {
+        return ipmi::responseUnspecifiedError();
     }
 }
 
@@ -6480,6 +6568,35 @@ bool getAlphaNumString(std::string& uniqueStr)
     return true;
 }
 
+std::vector<uint8_t> getAvailableChannels()
+{
+    std::vector<uint8_t> channelMap;
+    try
+    {
+        auto bus = sdbusplus::bus::new_default();
+        auto methodCall = bus.new_method_call(
+            userMgrInterface, userMgrObjBasePath, AccountPolicyInterface,
+            ChannelInterfaceMapMethod);
+
+        auto reply = bus.call(methodCall);
+
+        std::vector<std::pair<uint8_t, std::string>> channelList;
+        reply.read(channelList);
+
+        for (const auto& channel : channelList)
+        {
+            channelMap.push_back(channel.first);
+        }
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        lg2::error("unable to get available channels: {ERROR}", "ERROR",
+                   e.what());
+    }
+
+    return channelMap;
+}
+
 ipmi::RspType<std::vector<uint8_t>, std::vector<uint8_t>>
     ipmiGetBootStrapAccount(ipmi::Context::ptr ctx,
                             uint8_t disableCredBootStrap)
@@ -6493,6 +6610,16 @@ ipmi::RspType<std::vector<uint8_t>, std::vector<uint8_t>>
             phosphor::logging::log<level::ERR>(
                 "ipmiGetBootStrapAccount: Credential BootStrapping Disabled "
                 "Get BootStrap Account command rejected.");
+            return ipmi::response(ipmi::ipmiCCBootStrappingDisabled);
+        }
+
+        // If disableCredBootStrap is not 0xa5, only disable credential
+        // bootstrap
+        if (disableCredBootStrap != 0xa5)
+        {
+            setCredentialBootStrap(disableCredBootStrap);
+            phosphor::logging::log<level::INFO>(
+                "ipmiGetBootStrapAccount: Credential BootStrapping Disabled.");
             return ipmi::response(ipmi::ipmiCCBootStrappingDisabled);
         }
 
@@ -6539,15 +6666,19 @@ ipmi::RspType<std::vector<uint8_t>, std::vector<uint8_t>>
             return ipmi::responseResponseError();
         }
         std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
-
         std::string service =
             getService(*dbus, userMgrInterface, userMgrObjBasePath);
+
+        std::vector<uint8_t> availableChannels = getAvailableChannels();
+        size_t channelCount = availableChannels.size();
+        std::vector<std::string> privileges(channelCount, "priv-admin");
+        std::vector<uint8_t> channelAccess(channelCount, 1);
 
         // create the new user with only redfish-hostiface group access
         auto method = dbus->new_method_call(service.c_str(), userMgrObjBasePath,
                                             userMgrInterface, createUserMethod);
         method.append(userName, std::vector<std::string>{"redfish-hostiface"},
-                      "priv-admin", true);
+                      privileges, channelAccess, true);
         auto reply = dbus->call(method);
         if (reply.is_method_error())
         {
@@ -7413,6 +7544,80 @@ ipmi::RspType<uint8_t> ipmiOEMSetExtlogConfigs(
     return ipmi::responseSuccess();
 }
 
+ipmi::RspType<> ipmiOEMSetHealthStatus(
+    ipmi::Context::ptr& ctx, [[maybe_unused]] uint8_t dbNumber,
+    uint8_t resource, uint8_t health, message::Payload& req)
+{
+    ipmi::ChannelInfo chInfo;
+    try
+    {
+        getChannelInfo(ctx->channel, chInfo);
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        phosphor::logging::log<phosphor::logging::level::ERR>(
+            "ipmiOEMSetHealthStatus: Failed to get Channel Info",
+            phosphor::logging::entry("MSG: %s", e.description()));
+        return ipmi::responseUnspecifiedError();
+    }
+    if (chInfo.mediumType !=
+        static_cast<uint8_t>(ipmi::EChannelMediumType::systemInterface))
+    {
+        phosphor::logging::log<phosphor::logging::level::ERR>(
+            "ipmiOEMSetHealthStatus: Error - supported only in "
+            "System(SMS) interface");
+        return ipmi::responseInsufficientPrivilege();
+    }
+
+    std::string inventoryPath =
+        "/xyz/openbmc_project/inventory/system/chassis/";
+
+    std::vector<char> reqData;
+    if (req.unpack(reqData) != 0)
+    {
+        return ipmi::responseUnspecifiedError();
+    }
+
+    std::string devInstance(reqData.begin(), reqData.end());
+    auto healthItr = healthmap.find(health);
+    if (healthItr == healthmap.end())
+    {
+        return ipmi::responseInvalidFieldRequest();
+    }
+    std::string healthString = healthItr->second;
+
+    switch (resourceTypes(resource))
+    {
+        case resourceTypes::processor:
+        case resourceTypes::memory:
+            inventoryPath += "motherboard/" + devInstance;
+            break;
+        case resourceTypes::pcieDevice:
+            inventoryPath += "pciedevice/" + devInstance;
+            break;
+        default:
+            return ipmi::responseInvalidFieldRequest();
+    }
+
+    std::shared_ptr<sdbusplus::asio::connection> busp = getSdBus();
+    try
+    {
+        ipmi::setDbusProperty(*busp, "xyz.openbmc_project.OOBInventoryConfig",
+                              inventoryPath.c_str(), healthStatusInterface,
+                              "Health", healthString.c_str());
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        lg2::error("Failed to update {RESOURCE}  Health Status", "RESOURCE",
+                   devInstance.c_str());
+        return ipmi::responseUnspecifiedError();
+    }
+    lg2::info("Updated {RESOURCE} Health Status", "RESOURCE",
+              devInstance.c_str());
+
+    return ipmi::responseSuccess();
+}
+
 ipmi::RspType<bool, uint7_t, uint8_t, uint8_t> ipmiOEMGetExtlogConfigs()
 {
     bool ExtlogStatus = false;
@@ -7440,6 +7645,478 @@ ipmi::RspType<bool, uint7_t, uint8_t, uint8_t> ipmiOEMGetExtlogConfigs()
     }
 
     return ipmi::responseSuccess(ExtlogStatus, 0, LogLevel, ReqResLogLevel);
+}
+
+ConfigName getConfigName(const std::string& name)
+{
+    auto it = configNameMap.find(name);
+    if (it != configNameMap.end())
+    {
+        return it->second;
+    }
+    return ConfigName::Invalid;
+}
+
+uint32_t getPreserveConfig(sdbusplus::bus::bus& bus)
+{
+    auto call = bus.new_method_call(MAPPER_INTERFACE, MAPPER_PATH,
+                                    MAPPER_INTERFACE, "GetSubTreePaths");
+
+    call.append(PRESERVE_ROOT, 0, std::vector<std::string>{PRESERVE_INTERFACE});
+
+    auto reply = bus.call(call);
+    std::vector<std::string> configPaths;
+    reply.read(configPaths);
+
+    uint32_t configBits = 0;
+
+    for (size_t i = 0; i < configPaths.size() && i < MAX_PRESERVE_CONFIGS; ++i)
+    {
+        const auto& path = configPaths[i];
+
+        // Extract the configuration name from the path
+        size_t lastSlash = path.find_last_of('/');
+        std::string configNameStr = path.substr(lastSlash + 1);
+
+        ConfigName configName = getConfigName(configNameStr);
+
+        if (configName != ConfigName::Invalid)
+        {
+            auto getCall = bus.new_method_call(
+                "xyz.openbmc_project.EntityManager", path.c_str(),
+                dBusPropertyIntf, dBusPropertyGetMethod);
+
+            getCall.append(PRESERVE_INTERFACE, "isEnable");
+
+            auto propReply = bus.call(getCall);
+            std::variant<bool> value;
+            propReply.read(value);
+
+            if (std::get<bool>(value))
+            {
+                configBits |= (1 << static_cast<int>(configName));
+            }
+        }
+        else
+        {
+            std::cout << "Config name " << configNameStr
+                      << " is not valid, skipping." << std::endl;
+        }
+    }
+
+    return configBits;
+}
+
+void setPreserveConfig(sdbusplus::bus::bus& bus, uint32_t preserveBits)
+{
+    auto call = bus.new_method_call(MAPPER_INTERFACE, MAPPER_PATH,
+                                    MAPPER_INTERFACE, "GetSubTreePaths");
+
+    call.append(PRESERVE_ROOT, 0, std::vector<std::string>{PRESERVE_INTERFACE});
+
+    auto reply = bus.call(call);
+    std::vector<std::string> configPaths;
+    reply.read(configPaths);
+
+    for (size_t i = 0; i < configPaths.size() && i < MAX_PRESERVE_CONFIGS; ++i)
+    {
+        const auto& path = configPaths[i];
+
+        // Extract the configuration name from the path
+        size_t lastSlash = path.find_last_of('/');
+        std::string configNameStr = path.substr(lastSlash + 1);
+
+        ConfigName configName = getConfigName(configNameStr);
+
+        if (configName != ConfigName::Invalid)
+        {
+            bool value = (preserveBits >> static_cast<int>(configName)) & 0x1;
+
+            auto setCall = bus.new_method_call(
+                "xyz.openbmc_project.EntityManager", path.c_str(),
+                dBusPropertyIntf, dBusPropertySetMethod);
+
+            setCall.append(PRESERVE_INTERFACE, "isEnable",
+                           std::variant<bool>(value));
+
+            bus.call(setCall);
+        }
+        else
+        {
+            std::cout << "Config name " << configNameStr
+                      << " is not valid, skipping." << std::endl;
+        }
+    }
+}
+
+ipmi::RspType<uint32_t> ipmiOEMGetPreserveConfig()
+{
+    try
+    {
+        auto bus = sdbusplus::bus::new_default();
+        uint32_t preserve = getPreserveConfig(bus);
+        return ipmi::responseSuccess(preserve);
+    }
+    catch (const std::exception& e)
+    {
+        log<level::ERR>("Failed to get preserve config",
+                        entry("ERR=%s", e.what()));
+        return ipmi::responseUnspecifiedError();
+    }
+}
+
+ipmi::RspType<> ipmiOEMSetPreserveConfig(uint32_t preserve)
+{
+    constexpr uint32_t maxMask = (1 << MAX_PRESERVE_CONFIGS) - 1;
+
+    if (preserve & ~maxMask)
+    {
+        log<level::ERR>("Invalid preserve config: exceeds allowed bitmask",
+                        entry("PRESERVE=0x%08X", preserve));
+        return ipmi::responseInvalidFieldRequest();
+    }
+
+    try
+    {
+        auto bus = sdbusplus::bus::new_default();
+        setPreserveConfig(bus, preserve);
+        return ipmi::responseSuccess();
+    }
+    catch (const std::exception& e)
+    {
+        log<level::ERR>("Failed to set preserve config",
+                        entry("ERR=%s", e.what()));
+        return ipmi::responseUnspecifiedError();
+    }
+}
+
+void AddExtendedlogEntry(uint8_t sensorNumber, uint8_t sensorType,
+                         const std::vector<uint8_t>& extendedData,
+                         std::vector<uint8_t>& selDataRecord,
+                         std::vector<uint8_t>& eventDataRecord)
+{
+    std::string objpath("");
+    uint8_t typeFromPath;
+    try
+    {
+        objpath = getPathFromSensorNumber(sensorNumber, sensorType);
+        typeFromPath = getSensorTypeFromPath(objpath);
+        if (typeFromPath !=
+            sensorType) // if sensorType not matching, we assume sensor not
+                        // available so prioprity is givien to IPMI Type
+        {
+            objpath.clear();
+        }
+    }
+    catch (...)
+    {
+        log<level::ERR>("Failed to get sensor object path");
+    }
+
+    sdbusplus::bus::bus bus(ipmid_get_sd_bus_connection());
+    auto extendedSelData = ipmi::sel::toHexStr(extendedData);
+    std::string service =
+        ipmi::getService(bus, ipmiSELAddInterface, ipmiSELPath);
+    auto addSEL =
+        bus.new_method_call(service.c_str(), ipmiSELPath, ipmiSELAddInterface,
+                            "IpmiSelAddExtended");
+    addSEL.append(objpath.c_str(), selDataRecord, eventDataRecord,
+                  extendedSelData.c_str());
+    bus.call_noreply(addSEL);
+}
+
+uint16_t readLastEntryId()
+{
+    sdbusplus::bus::bus busLog{ipmid_get_sd_bus_connection()};
+    auto methodCall = busLog.new_method_call(
+        "xyz.openbmc_project.Settings", "/xyz/openbmc_project/logging/settings",
+        "org.freedesktop.DBus.Properties", "Get");
+
+    methodCall.append("xyz.openbmc_project.Logging.Settings", "lastEntryId");
+
+    try
+    {
+        auto reply = busLog.call(methodCall);
+
+        std::variant<uint16_t> value;
+        reply.read(value);
+
+        return std::get<uint16_t>(value);
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        std::cerr << "Failed to read lastEntryId : ERROR=" << e.what() << "\n";
+        return 0;
+    }
+}
+
+ipmi::RspType<uint16_t> ipmiOemExtendedAddSELEntry(
+    std::array<uint8_t, selDataSize> selData,
+    [[maybe_unused]] std::array<uint8_t, eventDataSize> eventData,
+    const std::vector<uint8_t> extendedData)
+{
+    std::vector<uint8_t> selDataRecord(selData.begin(), selData.end());
+    std::vector<uint8_t> eventDataRecord(eventData.begin(), eventData.end());
+    uint8_t recordType = selDataRecord[2];
+    uint8_t sensorType = selDataRecord[11];
+    uint8_t sensorNumber = selDataRecord[12];
+
+    uint16_t recordId = 0;
+    std::string selPolicy;
+    std::shared_ptr<sdbusplus::asio::connection> busp = getSdBus();
+    ipmi::sel::ObjectPaths entryPaths;
+
+    try
+    {
+        Value variant =
+            ipmi::getDbusProperty(*busp, settingsService, loggingSettingObjPath,
+                                  loggingSettingIntf, "SelPolicy");
+        selPolicy = std::get<std::string>(variant);
+        if (selPolicy == "xyz.openbmc_project.Logging.Settings.Policy.Linear")
+        {
+            auto method =
+                busp->new_method_call(settingsService, loggingSettingObjPath,
+                                      "org.freedesktop.DBus.Properties", "Get");
+
+            method.append(loggingSettingIntf, "InfoFlags");
+
+            auto reply = busp->call(method);
+            std::variant<std::map<std::string, bool>> infoVariant;
+            reply.read(infoVariant);
+
+            const auto& infoFlags =
+                std::get<std::map<std::string, bool>>(infoVariant);
+            auto it = infoFlags.find("ipmi");
+            if (it != infoFlags.end() && it->second)
+            {
+                return ipmi::responseOutOfSpace();
+            }
+        }
+    }
+    catch (const sdbusplus::exception_t& e)
+    {
+        phosphor::logging::log<phosphor::logging::level::ERR>(
+            "Failed to get SEL Policy information",
+            phosphor::logging::entry("MSG: %s", e.description()));
+        return ipmi::response(ipmi::ccUnspecifiedError);
+    }
+
+    if (extendedData.size() > extendedSelMaxSize)
+    {
+        return ipmi::responseReqDataLenInvalid();
+    }
+
+    if (extendedData.empty())
+    {
+        return ipmi::responseReqDataLenInvalid();
+    }
+
+    if (recordType != oemRecordType)
+    {
+        return ipmi::responseInvalidFieldRequest();
+    }
+    else
+    {
+        try
+        {
+            AddExtendedlogEntry(sensorNumber, sensorType, extendedData,
+                                selDataRecord, eventDataRecord);
+        }
+        catch (const std::exception& e)
+        {
+            log<level::ERR>("Failed to create D-Bus log entry for SEL, ERROR=",
+                            phosphor::logging::entry("EXCEPTION=%s", e.what()));
+            return ipmi::responseUnspecifiedError();
+        }
+    }
+
+    try
+    {
+        recordId = readLastEntryId();
+    }
+    catch (const sdbusplus::exception::exception& e)
+    {
+        log<level::ERR>("Failed to get recordId from dbus");
+        return ipmi::responseUnspecifiedError();
+    }
+
+    return ipmi::responseSuccess(recordId);
+}
+
+std::array<uint8_t, extendedSelMaxSize> convertToHexArray(
+    const std::string& hexString)
+{
+    std::array<uint8_t, extendedSelMaxSize> hexArray = {};
+    std::size_t hexArrayIndex = 0;
+
+    for (std::size_t i = 0;
+         i < hexString.size() && hexArrayIndex < hexArray.size(); i += 2)
+    {
+        std::string byteString = hexString.substr(i, 2);
+        uint8_t byte = static_cast<uint8_t>(std::stoi(byteString, nullptr, 16));
+        hexArray[hexArrayIndex++] = byte;
+    }
+    return hexArray;
+}
+
+ipmi::RspType<uint8_t, std::array<uint8_t, extendedSelMaxSize>>
+    ipmiOemExtendedGetSELEntry(uint16_t recordId)
+{
+    std::array<uint8_t, extendedSelMaxSize> extData = {};
+    std::string recordIdStr = std::to_string(recordId);
+    std::string objectPath = "/xyz/openbmc_project/logging/ipmi/" + recordIdStr;
+    std::string extendedSelPath = "/var/lib/phosphor-logging/ipmi/errors/";
+    if (!fs::exists(extendedSelPath))
+    {
+        extendedSelPath = "/etc/extlog/phosphor-logging/ipmi/errors/";
+    }
+
+    if (fs::exists(extendedSelPath + recordIdStr))
+    {
+        std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
+        try
+        {
+            ipmi::Value variant = ipmi::getDbusProperty(
+                *dbus, service, objectPath, interface, "AdditionalData");
+
+            std::vector<std::string> additionalData =
+                std::get<std::vector<std::string>>(variant);
+
+            std::string extSel = "EXTENDED_SEL_DATA=";
+            auto it = std::find_if(additionalData.begin(), additionalData.end(),
+                                   [&extSel](const std::string& str) {
+                                       return str.find(extSel) !=
+                                              std::string::npos;
+                                   });
+            if (it != additionalData.end())
+            {
+                std::string extendedData = *it;
+                std::size_t pos = extendedData.find(extSel);
+                if (pos != std::string::npos)
+                {
+                    extendedData = extendedData.substr(pos + extSel.size());
+                    extData = convertToHexArray(extendedData);
+                }
+                else
+                {
+                    log<level::ERR>("Record not found");
+                    return ipmi::responseSensorInvalid();
+                }
+            }
+            else
+            {
+                log<level::ERR>("Record not found");
+                return ipmi::responseSensorInvalid();
+            }
+        }
+        catch (std::exception& e)
+        {
+            log<level::ERR>("Failed to get AdditionalData",
+                            phosphor::logging::entry("EXCEPTION=%s", e.what()));
+            return ipmi::responseUnspecifiedError();
+        }
+    }
+    else
+    {
+        log<level::ERR>("Record doesn't exist");
+        return ipmi::responseSensorInvalid();
+    }
+    return ipmi::responseSuccess(extendedSelMaxSize, extData);
+}
+
+std::vector<uint8_t> stringToHexVector(const std::string& hexString)
+{
+    std::vector<uint8_t> hexVec;
+    for (size_t i = 0; i < hexString.length(); i += 2)
+    {
+        std::string byteString = hexString.substr(i, 2);
+        uint8_t byte =
+            static_cast<uint8_t>(std::stoul(byteString, nullptr, 16));
+        hexVec.push_back(byte);
+    }
+    return hexVec;
+}
+
+ipmi::RspType<uint16_t, uint8_t, std::vector<uint8_t>>
+    ipmiOemExtendedGetPartialSELEntry(uint16_t recordId, uint16_t offset,
+                                      uint16_t readLen)
+{
+    std::string recordIdStr = std::to_string(recordId);
+    std::string objectPath = "/xyz/openbmc_project/logging/ipmi/" + recordIdStr;
+    std::string extendedSelPath = "/var/lib/phosphor-logging/ipmi/errors/";
+    if (!fs::exists(extendedSelPath))
+    {
+        extendedSelPath = "/etc/extlog/phosphor-logging/ipmi/errors/";
+    }
+
+    uint8_t progress = 0;
+    std::vector<uint8_t> extData;
+
+    if (offset >= extendedSelMaxSize)
+    {
+        log<level::ERR>("Parameter Out Of Range");
+        return ipmi::responseParmOutOfRange();
+    }
+
+    if (readLen > (extendedSelMaxSize - offset))
+    {
+        log<level::ERR>("Invalid read Length");
+        return ipmi::responseInvalidFieldRequest();
+    }
+
+    if (fs::exists(extendedSelPath + recordIdStr))
+    {
+        std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
+        try
+        {
+            ipmi::Value variant = ipmi::getDbusProperty(
+                *dbus, service, objectPath, interface, "AdditionalData");
+            std::vector<std::string> additionalData =
+                std::get<std::vector<std::string>>(variant);
+            std::string extSel = "EXTENDED_SEL_DATA=";
+            auto it = std::find_if(additionalData.begin(), additionalData.end(),
+                                   [&extSel](const std::string& str) {
+                                       return str.find(extSel) !=
+                                              std::string::npos;
+                                   });
+            if (it != additionalData.end())
+            {
+                std::string extendedData = *it;
+                std::size_t pos = extendedData.find(extSel);
+                if (pos != std::string::npos)
+                {
+                    extendedData = extendedData.substr(pos + extSel.size());
+                    extData = stringToHexVector(extendedData);
+                    extData.resize(extendedSelMaxSize - 1, 0);
+                }
+                else
+                {
+                    log<level::ERR>("Record not found");
+                    return ipmi::responseSensorInvalid();
+                }
+            }
+            else
+            {
+                log<level::ERR>("Record not found");
+                return ipmi::responseSensorInvalid();
+            }
+        }
+        catch (std::exception& e)
+        {
+            log<level::ERR>("Failed to get AdditionalData",
+                            phosphor::logging::entry("EXCEPTION=%s", e.what()));
+            return ipmi::responseUnspecifiedError();
+        }
+    }
+    else
+    {
+        log<level::ERR>("Record not found");
+        return ipmi::responseSensorInvalid();
+    }
+    return ipmi::responseSuccess(
+        extendedSelMaxSize, progress,
+        std::vector<uint8_t>(extData.begin() + offset,
+                             extData.begin() + offset + readLen));
 }
 
 static void registerOEMFunctions(void)
@@ -7830,6 +8507,35 @@ static void registerOEMFunctions(void)
     registerHandler(prioOemBase, ami::netFnGeneral,
                     ami::general::cmdOEMGetExtlogConfigs, Privilege::User,
                     ipmiOEMGetExtlogConfigs);
+
+    // <Set Health Status>
+    registerHandler(prioOemBase, ami::netFnGeneral,
+                    ami::general::cmdOEMSetHealthStatus, Privilege::User,
+                    ipmiOEMSetHealthStatus);
+    // <Set Preserve Configurations>
+    registerHandler(prioOemBase, ami::netFnGeneral,
+                    ami::general::cmdSetPreserveConfig, Privilege::User,
+                    ipmiOEMSetPreserveConfig);
+
+    // <Get Preserve Configurations>
+    registerHandler(prioOemBase, ami::netFnGeneral,
+                    ami::general::cmdGetPreserveConfig, Privilege::User,
+                    ipmiOEMGetPreserveConfig);
+
+    // <Add Extended SEL data>
+    registerHandler(prioOemBase, ami::netFnGeneral,
+                    ami::general::cmdOEMAddExtendedSel, Privilege::Admin,
+                    ipmiOemExtendedAddSELEntry);
+
+    // <Get Extended SEL data>
+    registerHandler(prioOemBase, ami::netFnGeneral,
+                    ami::general::cmdOEMGetExtendedSel, Privilege::Admin,
+                    ipmiOemExtendedGetSELEntry);
+
+    // <Get Pratial Extended SEL data>
+    registerHandler(prioOemBase, ami::netFnGeneral,
+                    ami::general::cmdOEMGetPartialExtendedSel, Privilege::Admin,
+                    ipmiOemExtendedGetPartialSELEntry);
 }
 
 } // namespace ipmi
