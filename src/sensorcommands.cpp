@@ -572,9 +572,11 @@ bool constructDiscreteSdr(
     }
     std::replace(name.begin(), name.end(), '_', ' ');
     record.body.id_string_info = name.size();
-    std::strncpy(record.body.id_string, name.c_str(),
-                 sizeof(record.body.id_string) - 1);
-    record.body.id_string[sizeof(record.body.id_string) - 1] = '\0';
+    constexpr size_t maxLen = sizeof(record.body.id_string);
+    std::memset(record.body.id_string, 0, maxLen);
+    size_t copyLen = std::min(name.size(), maxLen);
+    std::memcpy(record.body.id_string, name.data(), copyLen);
+    record.body.id_string_info = copyLen;
 
     details::sdrStatsTable.updateName(sensorNumber, name);
     return true;
@@ -671,9 +673,11 @@ bool constructEventSdr(
 
     record.body.id_string_info = name.size();
 
-    std::strncpy(record.body.id_string, name.c_str(),
-                 sizeof(record.body.id_string) - 1);
-    record.body.id_string[sizeof(record.body.id_string) - 1] = '\0';
+    constexpr size_t maxLen = sizeof(record.body.id_string);
+    std::memset(record.body.id_string, 0, maxLen);
+    size_t copyLen = std::min(name.size(), maxLen);
+    std::memcpy(record.body.id_string, name.data(), copyLen);
+    record.body.id_string_info = copyLen;
 
     // Remember the sensor name, as determined for this sensor number
     details::sdrStatsTable.updateName(sensorNum, name);
@@ -1242,12 +1246,6 @@ ipmi::RspType<> ipmiSenSetSensorThresholds(
         return ipmi::response(status);
     }
 
-    // lower nc and upper nc not suppported on any sensor
-    if (lowerNonRecovThreshMask || upperNonRecovThreshMask)
-    {
-        return ipmi::responseInvalidFieldRequest();
-    }
-
     // if none of the threshold mask are set, nothing to do
     if (!(lowerNonCriticalThreshMask | lowerCriticalThreshMask |
           lowerNonRecovThreshMask | upperNonCriticalThreshMask |
@@ -1405,6 +1403,15 @@ ipmi::RspType<> ipmiSenSetSensorThresholds(
             {
                 return ipmi::responseInvalidFieldRequest();
             }
+            auto value = findLower->second;
+            // Convert the value to a double using std::visit
+            double doubleValue = std::visit(VariantToDoubleVisitor(), value);
+            if (std::isnan(doubleValue))
+            {
+                phosphor::logging::log<phosphor::logging::level::ERR>(
+                    "Invaild Lower Critical Threshold Value Setting");
+                return ipmi::responseInvalidFieldRequest();
+            }
             thresholdsToSet.emplace_back(
                 "NonRecoverableLow", lowerNonRecoverable, findThreshold->first);
         }
@@ -1413,6 +1420,15 @@ ipmi::RspType<> ipmiSenSetSensorThresholds(
             auto findUpper = findThreshold->second.find("NonRecoverableHigh");
             if (findUpper == findThreshold->second.end())
             {
+                return ipmi::responseInvalidFieldRequest();
+            }
+            auto value = findUpper->second;
+            // Convert the value to a double using std::visit
+            double doubleValue = std::visit(VariantToDoubleVisitor(), value);
+            if (std::isnan(doubleValue))
+            {
+                phosphor::logging::log<phosphor::logging::level::ERR>(
+                    "Invaild Lower Critical Threshold Value Setting");
                 return ipmi::responseInvalidFieldRequest();
             }
             thresholdsToSet.emplace_back("NonRecoverableHigh",
@@ -1426,6 +1442,10 @@ ipmi::RspType<> ipmiSenSetSensorThresholds(
         double valueToSet = ((mValue * std::get<thresholdValue>(property)) +
                              (bValue * std::pow(10.0, bExp))) *
                             std::pow(10.0, rExp);
+        if (valueToSet < min || valueToSet > max)
+        {
+            return ipmi::responseInvalidFieldRequest();
+        }
 
         setDbusProperty(
             *getSdBus(), connection, path, std::get<interface>(property),
@@ -2293,8 +2313,10 @@ bool constructSensorSdr(
     get_sdr::body::set_id_type(3, &record.body); // "8-bit ASCII + Latin 1"
 
     constexpr size_t maxLen = sizeof(record.body.id_string);
-    std::strncpy(record.body.id_string, name.c_str(), maxLen);
-    record.body.id_string[maxLen - 1] = '\0'; // Ensure null-termination
+    std::memset(record.body.id_string, 0, maxLen);
+    size_t copyLen = std::min(name.size(), maxLen);
+    std::memcpy(record.body.id_string, name.data(), copyLen);
+    record.body.id_string_info = copyLen;
 
     // Remember the sensor name, as determined for this sensor number
     details::sdrStatsTable.updateName(sensorNum, name);
@@ -3690,6 +3712,18 @@ void registerSensorFunctions()
     ipmi::registerHandler(ipmi::prioOemBase, ipmi::netFnSensor,
                           ipmi::sensor_event::cmdSetPefConfigurationParams,
                           ipmi::Privilege::Admin, ipmiPefSetConfParamCmd);
+
+    //<Set Last Processed Event ID>
+    ipmi::registerHandler(ipmi::prioOemBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdSetLastProcessedEventId,
+                          ipmi::Privilege::Operator,
+                          ipmiSetLastProcessedEventId);
+
+    //<Get Last Processed Event ID>
+    ipmi::registerHandler(ipmi::prioOemBase, ipmi::netFnSensor,
+                          ipmi::sensor_event::cmdGetLastProcessedEventId,
+                          ipmi::Privilege::Operator,
+                          ipmiGetLastProcessedEventId);
 
     // register all storage commands for both Sensor and Storage command
     // versions
