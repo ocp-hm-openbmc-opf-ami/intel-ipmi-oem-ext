@@ -273,8 +273,15 @@ constexpr auto cmdGetBiosPostCodeToIpmiMaxSize = 945;
 static constexpr Cmd cmdOEMGetTimezone = 0x9E;
 static constexpr Cmd cmdOEMSetTimezone = 0x9F;
 // 0xF1 to 0xFC reserved for IPMI Firmware update
+static constexpr Cmd cmdGetFWupdateProgress = 0xF1;
 static constexpr Cmd cmdSetPreserveConfig = 0xF2;
 static constexpr Cmd cmdGetPreserveConfig = 0xF3;
+static constexpr Cmd cmdSetFWupdateTargets = 0xF4;
+static constexpr Cmd cmdGetFWupdateTargets = 0xF5;
+static constexpr Cmd cmdSetFWUpdateTargetsBusy = 0xF6;
+static constexpr Cmd cmdGetFWUpdateTargetsBusy = 0xF7;
+static constexpr Cmd cmdSetFWUpdateApplyTime = 0xF8;
+static constexpr Cmd cmdGetFWUpdateApplyTime = 0xF9;
 static constexpr Cmd cmdOEMAddExtendedSel = 0xCC;
 static constexpr Cmd cmdOEMGetExtendedSel = 0xCD;
 static constexpr Cmd cmdOEMGetPartialExtendedSel = 0xCE;
