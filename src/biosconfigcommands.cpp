@@ -470,11 +470,13 @@ static bool getPostCompleted()
     try
     {
         std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
-        Value variant = getDbusProperty(
-            *dbus, "xyz.openbmc_project.State.Host0",
-            "/xyz/openbmc_project/state/host0",
-            "xyz.openbmc_project.State.OperatingSystem.Status",
-            "OperatingSystemState");
+
+        Value variant =
+            getDbusProperty(*dbus, "xyz.openbmc_project.State.Host0",
+                            "/xyz/openbmc_project/state/host0",
+                            "xyz.openbmc_project.State.OperatingSystem.Status",
+                            "OperatingSystemState");
+
         auto& value = std::get<std::string>(variant);
 
         // The short strings "Standby" is deprecated in favor of the

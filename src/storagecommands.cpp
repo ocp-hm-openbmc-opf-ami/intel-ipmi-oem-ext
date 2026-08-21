@@ -28,6 +28,7 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/container/flat_map.hpp>
+#include <boost/process.hpp>
 #include <ipmid/api.hpp>
 #include <ipmid/message.hpp>
 #include <ipmid/utils.hpp>
@@ -820,6 +821,7 @@ void recalculateHashes()
 {
     deviceHashes.clear();
     fruMap.clear();
+
     // hash the object paths to create unique device id's. increment on
     // collision
 #if CONFIGURABLE_FRU == 1
