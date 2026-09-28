@@ -61,6 +61,7 @@
 #include <xyz/openbmc_project/Software/Activation/server.hpp>
 #include <xyz/openbmc_project/Software/Version/server.hpp>
 
+#include <cerrno>
 #include <random>
 /*TODO: enable once phosphor-dbus-interface patch updated
 #include <xyz/openbmc_project/USB/status/server.hpp>
@@ -189,6 +190,18 @@ const static constexpr char* settingsService = "xyz.openbmc_project.Settings";
 const static constexpr char* settingsObjPath =
     "/xyz/openbmc_project/logging/settings";
 const static constexpr char* settingsUSBIntf = "xyz.openbmc_project.USB";
+
+// USB Power Save Mode Commands
+#define POWERSAVE_MODE_ENABLE 0x00
+#define POWERSAVE_MODE_DISABLE 0x01
+#define BIOS_COMM_START 0x10
+#define BIOS_COMM_END 0x11
+
+// BIOS communication lock for power save mode
+// Initialize from flag file so service restarts don't lose lock state
+#define BIOS_BMC_COMMUNICATION_STATUS "/var/tmp/bioscomm"
+static bool biosPowerSaveModeLocked =
+    std::filesystem::exists(BIOS_BMC_COMMUNICATION_STATUS);
 
 const static constexpr char* snmpService = "xyz.openbmc_project.Snmp.Conf";
 const static constexpr char* snmpObjPath =
@@ -6811,34 +6824,198 @@ ipmi::RspType<> ipmiOEMEnDisPwrSaveMode(std::optional<uint8_t> req)
         return ipmi::responseReqDataLenInvalid();
     }
 
-    if ((*req) != 0 && (*req) != 1)
+    uint8_t cmd = *req;
+
+    if (cmd != POWERSAVE_MODE_ENABLE && cmd != POWERSAVE_MODE_DISABLE &&
+        cmd != BIOS_COMM_START && cmd != BIOS_COMM_END)
     {
         return ipmi::responseInvalidFieldRequest();
     }
 
-    std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
-
-    auto method = dbus->new_method_call(settingsService, settingsObjPath,
-                                        settingsUSBIntf, "SetUSBPowerSaveMode");
-
-    method.append(static_cast<int>(*req));
-    try
+    // Common lock validation: BIOS_COMM_END requires lock held; all others
+    // require it free
+    if (cmd == BIOS_COMM_END && !biosPowerSaveModeLocked)
     {
-        auto data = dbus->call(method);
-        data.read(resp);
-        if (resp == 0xC0 || resp < 0)
+        return ipmi::response(ipmi::ccInvalidFieldRequest);
+    }
+    if (cmd != BIOS_COMM_END && biosPowerSaveModeLocked)
+    {
+        return ipmi::response(ipmi::ccBusy);
+    }
+
+    // Handle regular user commands (0 and 1)
+    if (cmd == POWERSAVE_MODE_ENABLE || cmd == POWERSAVE_MODE_DISABLE)
+    {
+        std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
+
+        auto method =
+            dbus->new_method_call(settingsService, settingsObjPath,
+                                  settingsUSBIntf, "SetUSBPowerSaveMode");
+
+        method.append(static_cast<int>(cmd));
+        try
         {
-            phosphor::logging::log<phosphor::logging::level::ERR>(
-                "ipmiOEMEnDisPwrSaveMode: Error - Busy node or ioctl failed");
-            return ipmi::response(ipmi::ccBusy);
+            auto data = dbus->call(method);
+            data.read(resp);
+            if (resp == 0xC0 || resp < 0)
+            {
+                phosphor::logging::log<phosphor::logging::level::ERR>(
+                    "ipmiOEMEnDisPwrSaveMode: Error - Busy node or ioctl failed");
+                return ipmi::response(ipmi::ccBusy);
+            }
         }
+        catch (sdbusplus::exception_t& e)
+        {
+            phosphor::logging::log<phosphor::logging::level::ERR>(e.what());
+            return ipmi::response(ipmi::ccUnspecifiedError);
+        }
+        return ipmi::responseSuccess();
     }
-    catch (const sdbusplus::exception_t& e)
+    // Handle BIOS BMC Communication responses
+    else if (cmd == BIOS_COMM_START)
     {
-        std::cerr << "SetUSBPowerSaveMode method call failed \n";
-        return ipmi::response(ipmi::ccUnspecifiedError);
+        biosPowerSaveModeLocked = true;
+
+        std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
+
+        // Get device status first
+        auto getMethod =
+            dbus->new_method_call(settingsService, settingsObjPath,
+                                  settingsUSBIntf, "GetUSBPowerSaveMode");
+        int currentStatus = 0;
+        try
+        {
+            auto getData = dbus->call(getMethod);
+            getData.read(currentStatus);
+        }
+        catch (const sdbusplus::exception_t& e)
+        {
+            // Reset lock so BIOS_COMM_START can be retried
+            biosPowerSaveModeLocked = false;
+            return ipmi::response(ipmi::ccUnspecifiedError);
+        }
+
+        // If status == 1 then power save mode is ON (devices disabled), disable
+        // power save mode to enable them
+        if (currentStatus == 1)
+        {
+            auto method =
+                dbus->new_method_call(settingsService, settingsObjPath,
+                                      settingsUSBIntf, "SetUSBPowerSaveMode");
+            method.append(static_cast<int>(
+                0)); // Disable power save mode (enable USB devices)
+
+            try
+            {
+                auto data = dbus->call(method);
+                data.read(resp);
+                if (resp == 0xC0 || resp < 0)
+                {
+                    // Reset lock so BIOS_COMM_START can be retried
+                    biosPowerSaveModeLocked = false;
+                    return ipmi::response(ipmi::ccBusy);
+                }
+            }
+            catch (const sdbusplus::exception_t& e)
+            {
+                // Reset lock so BIOS_COMM_START can be retried
+                biosPowerSaveModeLocked = false;
+                return ipmi::response(ipmi::ccUnspecifiedError);
+            }
+        }
+        // If status == 0, power save mode already OFF (devices already enabled)
+        // - return success
+
+        // Create file flag to indicate BIOS communication is active
+        {
+            std::ofstream flagFile(BIOS_BMC_COMMUNICATION_STATUS);
+            if (!flagFile.is_open())
+            {
+                biosPowerSaveModeLocked = false;
+                return ipmi::response(ipmi::ccUnspecifiedError);
+            }
+        }
+
+        return ipmi::responseSuccess();
     }
-    return ipmi::responseSuccess();
+    else // BIOS_COMM_END
+    {
+        // Do NOT clear biosPowerSaveModeLocked yet — keep it true so that
+        // if any step below fails, BIOS_COMM_END can be retried.
+
+        std::shared_ptr<sdbusplus::asio::connection> dbus = getSdBus();
+
+        // Get device status first
+        auto getMethod =
+            dbus->new_method_call(settingsService, settingsObjPath,
+                                  settingsUSBIntf, "GetUSBPowerSaveMode");
+        int currentStatus = 0;
+        try
+        {
+            auto getData = dbus->call(getMethod);
+            getData.read(currentStatus);
+        }
+        catch (const sdbusplus::exception_t& e)
+        {
+            return ipmi::response(ipmi::ccUnspecifiedError);
+        }
+
+        // If status == 0 then power save mode is OFF (devices enabled), enable
+        // power save mode to disable them
+        if (currentStatus == 0)
+        {
+            // Remove file flag first so that SetUSBPowerSaveMode is not blocked
+            // by the BIOS communication guard in the settings service
+            if (unlink(BIOS_BMC_COMMUNICATION_STATUS) != 0 && errno != ENOENT)
+            {
+                phosphor::logging::log<phosphor::logging::level::ERR>(
+                    "Failed to remove BIOS communication flag file");
+                return ipmi::response(ipmi::ccUnspecifiedError);
+            }
+
+            auto restoreCommunicationFlag = [] {
+                std::ofstream flagFile(BIOS_BMC_COMMUNICATION_STATUS);
+                return flagFile.is_open();
+            };
+
+            auto method =
+                dbus->new_method_call(settingsService, settingsObjPath,
+                                      settingsUSBIntf, "SetUSBPowerSaveMode");
+            method.append(static_cast<int>(
+                1)); // Enable power save mode (disable USB devices)
+
+            try
+            {
+                auto data = dbus->call(method);
+                data.read(resp);
+                if (resp == 0xC0 || resp < 0)
+                {
+                    restoreCommunicationFlag();
+                    return ipmi::response(ipmi::ccBusy);
+                }
+            }
+            catch (const sdbusplus::exception_t& e)
+            {
+                restoreCommunicationFlag();
+                return ipmi::response(ipmi::ccUnspecifiedError);
+            }
+        }
+        else
+        {
+            // If status == 1, power save mode already ON (devices already
+            // disabled) - just remove the flag
+            if (unlink(BIOS_BMC_COMMUNICATION_STATUS) != 0 && errno != ENOENT)
+            {
+                phosphor::logging::log<phosphor::logging::level::ERR>(
+                    "Failed to remove BIOS communication flag file");
+                return ipmi::response(ipmi::ccUnspecifiedError);
+            }
+        }
+
+        // All steps succeeded — clear the lock
+        biosPowerSaveModeLocked = false;
+        return ipmi::responseSuccess();
+    }
 }
 
 ipmi::RspType<uint8_t> ipmiOEMGetPwrSaveMode()
