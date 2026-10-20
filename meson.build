@@ -52,18 +52,42 @@ add_project_arguments(
     cpp.get_supported_arguments(all_args),
     language : 'cpp')
 
+if get_option('tests').enabled()
+    add_project_arguments(
+        '-Wno-unused-variable',
+        '-Wno-format-overflow',
+        '-Wno-error=maybe-uninitialized',
+        language: 'cpp')
+    add_project_arguments('-DUNIT_TESTING', language: 'cpp')
+endif
+
 fs = import('fs')
 
 root_inc = include_directories('.', 'include')
 
 # Dependencies
 nlohmann_json_dep = dependency('nlohmann_json', include_type: 'system')
-phosphor_dbus_interfaces_dep = dependency('phosphor-dbus-interfaces')
-phosphor_logging_dep = dependency('phosphor-logging')
-sdbusplus_dep = dependency('sdbusplus')
-ipmid_dep = dependency('libipmid')
-channellayer_dep = dependency('libchannellayer')
-userlayer_dep = dependency('libuserlayer')
+if get_option('tests').enabled()
+    _host_ipmid_sp = subproject(
+        'phosphor-host-ipmid', default_options: ['tests=enabled'])
+    run_command(
+        'ln', '-sfn', '.',
+        meson.current_source_dir() / 'subprojects/phosphor-host-ipmid/phosphor-ipmi-host',
+        check: true)
+    ipmid_dep = _host_ipmid_sp.get_variable('ipmid_dep')
+    userlayer_dep = _host_ipmid_sp.get_variable('userlayer_dep')
+    channellayer_dep = _host_ipmid_sp.get_variable('channellayer_dep')
+    phosphor_logging_dep = subproject('phosphor-logging').get_variable('phosphor_logging_dep')
+    sdbusplus_dep = _host_ipmid_sp.get_variable('sdbusplus_dep')
+    phosphor_dbus_interfaces_dep = _host_ipmid_sp.get_variable('phosphor_dbus_interfaces_dep')
+else
+    sdbusplus_dep = dependency('sdbusplus')
+    phosphor_dbus_interfaces_dep = dependency('phosphor-dbus-interfaces')
+    phosphor_logging_dep = dependency('phosphor-logging')
+    ipmid_dep = dependency('libipmid')
+    userlayer_dep = dependency('libuserlayer')
+    channellayer_dep = dependency('libchannellayer')
+endif
 boost_process_dep = dependency('boost', modules: ['process'])
 
 
